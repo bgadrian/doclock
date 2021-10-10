@@ -1,14 +1,22 @@
-package docstore_leader_go
+/* Package doclock  is a simple binary lock (mutex) library built on top of  Docstore (Firestore, DynamoDB or MongoDB): https:gocloud.dev/howto/docstore/
+Each resource ID will have its own document in a collection.
+Active lock will be stored in each document, with a TTL.
+*/
+
+package doclock
+
+// go install github.com/golang/mock/mockgen@v1.6.0
+//go:generate mockgen -source=lock.go --destination=tests/mock_datasource.go --package tests
 
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"sync"
 	"time"
 
 	"gocloud.dev/docstore"
 	"gocloud.dev/gcerrors"
-	"golang.org/x/exp/rand"
 )
 
 // KEY is the collection name of the Key property.
@@ -19,29 +27,21 @@ var (
 	ErrNotHeld  = errors.New("lock not held")
 )
 
-// Doc is the internal document. Exported only for marshalling.
-type Doc struct {
-	ID              string `docstore:"id"` //the resourceID
-	ExpirationTime  time.Time
-	ExpirationActor uint64
-
-	//for optimistic concurrency
-	DocstoreRevision interface{}
-}
-
-func (d *Doc) isExpired() bool {
-	return d.ExpirationTime.Before(time.Now())
-}
-func (d *Doc) hasLease(actorID uint64) bool {
-	return !d.isExpired() && d.ExpirationActor == actorID
+// Collection is a subset of methods of *docstore.Collection
+//TODO make this more abstract, and implement a wrapper to use any other storage
+type Collection interface {
+	Put(ctx context.Context, doc docstore.Document) error
+	Delete(ctx context.Context, doc docstore.Document) error
+	Get(ctx context.Context, doc docstore.Document, fps ...docstore.FieldPath) error
 }
 
 type Lock struct {
-	collection *docstore.Collection
+	collection Collection
 	resourceID string
 	actorID    uint64
 	acquired   bool
 	m          sync.Mutex
+	//closeKeeper chan struct{}
 
 	lockPollDuration       time.Duration
 	leaseTTLUpdateInterval time.Duration
@@ -52,20 +52,40 @@ type LockBuilder struct {
 	l *Lock
 }
 
-func New(collection *docstore.Collection, resourceID string) *LockBuilder {
-	return &LockBuilder{l: &Lock{
-		collection: collection,
-		resourceID: resourceID,
-		actorID:    nonZeroRandom(),
+func New(collection Collection, resourceID string) *LockBuilder {
+	return &LockBuilder{
+		l: &Lock{
+			collection: collection,
+			resourceID: resourceID,
+			actorID:    nonZeroRandom(),
 
-		//TODO expose these as builder methods
-		lockPollDuration:       time.Millisecond * 500,
-		leaseTTLUpdateInterval: time.Second * 9,
-		leaseTTL:               time.Second * 30,
-	},
+			lockPollDuration:       time.Millisecond * 500,
+			leaseTTLUpdateInterval: time.Second * 9,
+			leaseTTL:               time.Second * 30,
+		},
 	}
 }
 
+// WithLockPollDuration sets a custom maximum duration between 2 attempts to acquire the lock
+func (b *LockBuilder) WithLockPollDuration(d time.Duration) *LockBuilder {
+	b.l.lockPollDuration = d
+	return b
+}
+
+// WithLeaseTTLUpdateInterval sets a custom update rate of the extension of lease/TTL
+// A document.Update with now+LeaseTTL will be called at each tick, while the lock is acquired.
+func (b *LockBuilder) WithLeaseTTLUpdateInterval(d time.Duration) *LockBuilder {
+	b.l.leaseTTLUpdateInterval = d
+	return b
+}
+
+// WithLeaseTTL sets a custom TTL for the lock
+func (b *LockBuilder) WithLeaseTTL(d time.Duration) *LockBuilder {
+	b.l.leaseTTL = d
+	return b
+}
+
+// Build builds a lock instance
 func (b *LockBuilder) Build() *Lock {
 	return b.l
 }
@@ -110,7 +130,9 @@ func (l *Lock) Lock(ctx context.Context) (<-chan struct{}, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err() //stop trying, the actor doesn't want it anymore
 		case <-time.After(doc.ExpirationTime.Sub(time.Now()) + time.Millisecond*5):
-			//retry after we know for sure we have a chance
+		//retry after we know for sure we have a chance
+		case <-time.After(l.lockPollDuration):
+			//retry as a poll, maybe the actor unlocked its lock
 		}
 	}
 }
@@ -119,6 +141,7 @@ func (l *Lock) afterAcquisition() <-chan struct{} {
 	l.acquired = true
 
 	c := make(chan struct{})
+	//l.closeKeeper = make(chan struct{})
 	go l.updateLease(l.actorID, c)
 	return c
 }
@@ -126,13 +149,16 @@ func (l *Lock) afterAcquisition() <-chan struct{} {
 // updateLease keeps the lease updated as long as it can
 // it should not access l properties as it is not thread safe
 func (l *Lock) updateLease(actorID uint64, lostSignal chan struct{}) {
-	defer close(lostSignal)
 	ticker := time.NewTicker(l.leaseTTLUpdateInterval)
-	defer ticker.Stop()
+
+	defer func() {
+		close(lostSignal)
+		ticker.Stop()
+	}()
 
 	doc := Doc{ID: l.resourceID}
 	for {
-		//as best effort to keep the lease, we first update it, then wait the tick
+		<-ticker.C
 
 		err := l.collection.Get(context.Background(), &doc)
 		if err != nil {
@@ -161,8 +187,6 @@ func (l *Lock) updateLease(actorID uint64, lostSignal chan struct{}) {
 			//TODO add retrier
 			break
 		}
-		//OK
-		<-ticker.C
 	}
 }
 
@@ -178,7 +202,12 @@ func (l *Lock) Unlock() error {
 	doc := Doc{ID: l.resourceID}
 
 	//TODO add retrier
-	return l.collection.Delete(context.Background(), &doc)
+	//TODO trigger a close for updateLease
+	err := l.collection.Delete(context.Background(), &doc)
+	l.actorID = 0
+	l.acquired = false
+	//close(l.closeKeeper)
+	return err
 }
 
 func nonZeroRandom() uint64 {
