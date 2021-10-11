@@ -137,3 +137,29 @@ func TestLock_Contention(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLock_ActiveLease(t *testing.T) {
+	c := gomock.NewController(t)
+	coll := NewMockCollection(c)
+	ctx := context.Background()
+	waitTime := time.Millisecond * 50
+	testDuration := waitTime * 10
+	minUpdates := 7 //we test the KeppAlive functionality, at least 7 times
+
+	lock := doclock.New(coll, cid).
+		WithActorID(42).
+		WithLeaseTTLUpdateInterval(waitTime).Build()
+	coll.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, doc docstore.Document, fps ...docstore.FieldPath) error {
+			d := asDoc(doc)
+			//we test a Resuming of the Lock
+			d.ExpirationActor = 42
+			d.ExpirationTime = time.Now().Add(time.Millisecond * 150)
+			return nil
+		}).MinTimes(minUpdates)
+	coll.EXPECT().Put(gomock.Any(), gomock.Any()).MinTimes(minUpdates)
+
+	_, _ = lock.Lock(ctx)
+	time.Sleep(testDuration)
+	//gomock will take care of assert because MinTimes
+}

@@ -85,6 +85,12 @@ func (b *LockBuilder) WithLeaseTTL(d time.Duration) *LockBuilder {
 	return b
 }
 
+// WithActorID sets a custom ActorID. It is not recommended!
+func (b *LockBuilder) WithActorID(d uint64) *LockBuilder {
+	b.l.actorID = d
+	return b
+}
+
 // Build builds a lock instance
 func (b *LockBuilder) Build() *Lock {
 	return b.l
@@ -132,7 +138,7 @@ func (l *Lock) Lock(ctx context.Context) (<-chan struct{}, error) {
 		case <-time.After(doc.ExpirationTime.Sub(time.Now()) + time.Millisecond*5):
 		//retry after we know for sure we have a chance
 		case <-time.After(l.lockPollDuration):
-			//retry as a poll, maybe the actor unlocked its lock
+			//retry as a poll, maybe the leader unlocked or died
 		}
 	}
 }
