@@ -1,18 +1,18 @@
-package leader
+package doclock
 
 import (
 	"context"
-
-	"github.com/bgadrian/doclock"
 )
 
+//go:generate mockgen -source=leader.go --destination=tests/mock_leader.go --package tests
 type Leader interface {
 	IsLeader()
 	IsFollower()
 }
 
 // WrapLockWithLeader is a helper that calls the Leader methods based on Locks status
-func WrapLockWithLeader(ctx context.Context, l *doclock.Lock, actor Leader) {
+// blocks as long as ctx is active and lock is acquired
+func WrapLockWithLeader(ctx context.Context, l *Lock, actor Leader) {
 	actor.IsFollower()
 	for {
 		if ctx.Err() != nil {
@@ -24,7 +24,12 @@ func WrapLockWithLeader(ctx context.Context, l *doclock.Lock, actor Leader) {
 			continue //keep trying
 		}
 		actor.IsLeader()
-		<-leaderCh //blocks while this lock is acquired
+		select {
+		case <-ctx.Done():
+			return
+		case <-leaderCh: //blocks while this lock is acquired
+			//falltrough
+		}
 		actor.IsFollower()
 	}
 }

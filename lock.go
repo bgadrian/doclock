@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,8 +111,12 @@ func (l *Lock) Lock(ctx context.Context) (<-chan struct{}, error) {
 
 	for {
 		err := l.collection.Get(ctx, &doc)
+		var notFound bool
 		if err != nil {
-			return nil, err
+			notFound = isNotFound(err)
+			if !notFound {
+				return nil, err
+			}
 		}
 
 		//this actor already has an active lease on it, this is a resume
@@ -119,12 +124,14 @@ func (l *Lock) Lock(ctx context.Context) (<-chan struct{}, error) {
 			lostCh := l.afterAcquisition()
 			return lostCh, nil
 		}
-		if doc.isExpired() {
+		if notFound || doc.isExpired() {
 			doc.ExpirationActor = l.actorID
 			doc.ExpirationTime = time.Now().Add(l.leaseTTL)
 
 			err = l.collection.Put(ctx, &doc)
 			if err != nil {
+				//TODO retry/continue when the error is from optimistic locking
+				//it means 2 concurrent locks created the doc
 				return nil, err
 			}
 			//successfully acquired the lock
@@ -223,4 +230,11 @@ func nonZeroRandom() uint64 {
 			return r
 		}
 	}
+}
+
+func isNotFound(err error) bool {
+	if strings.Contains(err.Error(), "not found") {
+		return true
+	}
+	return gcerrors.Code(err) == gcerrors.NotFound
 }
